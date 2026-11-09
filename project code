@@ -1,0 +1,745 @@
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <IRremote.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// =========================================================================
+// --- BLINDS DURATION CONFIGURATION ---
+// =========================================================================
+unsigned long blindStepTimeDown = 6910;  // Duration per step when going DOWN
+unsigned long blindStepTimeUp   = 11800; // Duration per step when going UP
+
+// --- Pin Definitions (Ordered Sequentially by ESP32 GPIO Pin Number) ---
+#define BED_PWM_PIN 2     // Dedicated PWM Pin for Bed Lamp Dimming on GPIO 2
+#define ONE_WIRE_BUS 4    // DS18B20 Temp Sensor Data Pin
+#define MOTOR_ENA 5       // L298N Blinds Speed PWM Enable Pin
+#define TUBE_LED 12       // Tube Light Status Indicator LED
+#define FAN_LED 13        // Fan Status Indicator LED
+#define BED_LED 14        // Bed Lamp Status Indicator LED (GPIO 14)
+#define IR_RECEIVE_PIN 15 // IR Remote Receiver Pin
+#define MOTOR_IN1 16      // L298N Motor Direction Pin 1
+#define MOTOR_IN2 17      // L298N Motor Direction Pin 2
+#define FAN_RELAY 18      // Fan Active LOW Relay
+#define STATUS_LED 23     // Always ON Status LED (Turns OFF during Movie Mode)
+#define NIGHT_LED 25      // Night Mode Indicator LED
+#define BUZZER_PIN 26     // Buzzer Feedback Pin (Soft acoustic feedback via tone)
+#define MOVIE_LED 27      // Movie Mode Indicator LED
+#define NIGHT_SWITCH 32   // Physical Push-Hold Night Mode Switch
+#define TUBE_RELAY 33     // Tube Light Active LOW Relay
+
+// --- Verified IR Remote Hex Codes ---
+#define IR_1     0xBA45FF00
+#define IR_2     0xB946FF00
+#define IR_3     0xB847FF00
+#define IR_7     0xF807FF00
+#define IR_8     0xEA15FF00
+#define IR_9     0xF609FF00
+#define IR_0     0xE619FF00
+#define IR_STAR  0xE916FF00
+#define IR_HASH  0xF20DFF00
+#define IR_UP    0xE718FF00
+#define IR_DOWN  0xAD52FF00
+#define IR_LEFT  0xF708FF00
+#define IR_RIGHT 0xA55AFF00
+
+// --- Bluetooth BLE UUIDs (Standard Nordic UART Service) ---
+#define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+// LCD Setup (16 chars, 2 lines, I2C address 0x27)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// DS18B20 Setup
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// --- System States & Variables ---
+bool systemActive = true;
+bool nightModeActive = false;
+bool tubeLightState = false;
+bool bedLampState = false;
+bool fanManualOverride = false;
+float targetTemp = 28.0; 
+
+// --- Internal Clock & 12-Hour Alarm Variables ---
+int currentHour24 = 7;
+int currentMinute = 0;
+int currentSecond = 0;
+unsigned long lastSecondMillis = 0;
+
+// Daily Alarm Configuration
+int alarmHour24 = 6;
+int alarmMinute = 0;
+bool alarmEnabled = true; 
+bool alarmFiredToday = false;
+
+// Airport Board Scrolling Variables
+unsigned long lastScrollMillis = 0;
+const unsigned long scrollInterval = 300; 
+int scrollIndex = 0;
+
+// Environmental Tracking
+float currentTemp = 0.0;
+const float BUFFER_TEMP = 1.0; 
+
+// Physical Push-Hold Night Switch Variables
+bool lastPhysicalNightState = HIGH;
+
+// Movie Mode State Variables (4-Stage Cycle)
+int movieModeStep = 0; 
+int movieSubStep = 0;
+unsigned long movieTimer = 0;
+
+// Blinds Variables
+int currentBlindStep = 1;     
+int desiredBlindStep = 1;     
+bool blindsMoving = false;
+unsigned long blindsStartTime = 0;
+unsigned long blindsDuration = 0;
+int movementStartStep = 1;
+
+// Bed Lamp 5-Level Brightness Control
+int bedBrightnessLevel = 3; 
+const int bedPWMLevels[6] = {0, 30, 75, 140, 200, 255}; 
+
+// Non-blocking Temperature State Machine Variables
+unsigned long previousTempMillis = 0;
+const long tempInterval = 2000;
+unsigned long tempRequestTime = 0;
+bool tempConversionStarted = false;
+
+// BLE Connection & Execution Flags
+bool bleDeviceConnected = false;
+bool doRestartAdvertising = false;   
+bool bleCommandReceived = false;
+char pendingBleCommand = '\0';
+String pendingBleString = "";
+
+// Global BLE Server Pointer & 10-Second Unconnected Heartbeat Timer
+BLEServer *pServer = NULL;
+unsigned long lastAdvRefreshMillis = 0;
+const unsigned long advRefreshInterval = 10000; 
+
+// Forward Declarations
+void handleRemoteCommand(unsigned long cmd);
+void handleCharCommand(char cmd);
+void updateDisplay();
+void stopBlinds();
+void setNightMode(bool enable);
+void setBedLamp(bool state, int level);
+void cleanBeep();
+void doubleBeepBuzzer();
+void multiBeepBuzzer(int count);
+void runBlindsEngine(unsigned long currentMillis);
+void triggerAlarmRoutine();
+
+// --- BLE Callbacks ---
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnected(BLEServer* pServer) {
+      bleDeviceConnected = true;
+      Serial.println("BLE Client Connected from App.");
+    };
+    void onDisconnected(BLEServer* pServer) {
+      bleDeviceConnected = false;
+      Serial.println("BLE Client Disconnected.");
+      doRestartAdvertising = true; 
+    }
+};
+
+class MyRxCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String rxValue = pCharacteristic->getValue();
+      
+      if (rxValue.length() > 0) {
+        pendingBleString = rxValue;
+        pendingBleString.trim();
+        pendingBleString.toUpperCase(); 
+        
+        // 1. Current Time Format: T1231A or T1231P
+        if (pendingBleString.startsWith("T") && pendingBleString.length() == 6) {
+          int hh = pendingBleString.substring(1, 3).toInt();
+          int mm = pendingBleString.substring(3, 5).toInt();
+          char ampm = pendingBleString.charAt(5);
+
+          if (hh >= 1 && hh <= 12 && mm >= 0 && mm <= 59 && (ampm == 'A' || ampm == 'P')) {
+            if (ampm == 'P' && hh != 12) hh += 12;
+            if (ampm == 'A' && hh == 12) hh = 0;
+            
+            currentHour24 = hh;
+            currentMinute = mm;
+            currentSecond = 0;
+            Serial.printf("Clock Synchronized -> %02d:%02d (%cM)\n", (hh == 0 ? 12 : (hh > 12 ? hh - 12 : hh)), mm, ampm);
+            doubleBeepBuzzer();
+          }
+        }
+        // 2. Alarm Time Format: S0450A or S0450P
+        else if (pendingBleString.startsWith("S") && pendingBleString.length() == 6) {
+          int hh = pendingBleString.substring(1, 3).toInt();
+          int mm = pendingBleString.substring(3, 5).toInt();
+          char ampm = pendingBleString.charAt(5);
+
+          if (hh >= 1 && hh <= 12 && mm >= 0 && mm <= 59 && (ampm == 'A' || ampm == 'P')) {
+            if (ampm == 'P' && hh != 12) hh += 12;
+            if (ampm == 'A' && hh == 12) hh = 0;
+            
+            alarmHour24 = hh;
+            alarmMinute = mm;
+            alarmEnabled = true; 
+            alarmFiredToday = false;
+            Serial.printf("Custom Alarm Updated -> %02d:%02d (%cM) [Enabled]\n", (hh == 0 ? 12 : (hh > 12 ? hh - 12 : hh)), mm, ampm);
+            doubleBeepBuzzer();
+          }
+        }
+        // 3. Toggle Alarm ON/OFF Button: A
+        else if (pendingBleString.equals("A")) {
+          alarmEnabled = !alarmEnabled;
+          alarmFiredToday = false;
+          Serial.print("Alarm Toggled via Mobile Button: ");
+          Serial.println(alarmEnabled ? "ENABLED" : "DISABLED");
+          cleanBeep();
+        }
+        else {
+          char incomingChar = pendingBleString.charAt(0);
+          Serial.print("App Command Byte Received -> Char: '");
+          Serial.print(incomingChar);
+          Serial.println("'");
+          pendingBleCommand = incomingChar;
+          bleCommandReceived = true;
+        }
+      }
+    }
+};
+
+void setup() {
+  Serial.begin(115200);
+  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
+
+  sensors.begin();
+  sensors.setResolution(9);            
+  sensors.setWaitForConversion(false); 
+
+  pinMode(FAN_RELAY, OUTPUT);
+  pinMode(TUBE_RELAY, OUTPUT);
+  digitalWrite(FAN_RELAY, HIGH);
+  digitalWrite(TUBE_RELAY, HIGH);
+  
+  lcd.init();                                     
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Room Automation"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("Initializing..."));
+  delay(1000);
+
+  pinMode(MOTOR_IN1, OUTPUT);
+  pinMode(MOTOR_IN2, OUTPUT);
+  
+  ledcAttach(MOTOR_ENA, 5000, 8); 
+  ledcWrite(MOTOR_ENA, 0);
+
+  ledcAttach(BED_PWM_PIN, 5000, 8); 
+  ledcWrite(BED_PWM_PIN, 0); 
+
+  pinMode(TUBE_LED, OUTPUT);
+  pinMode(FAN_LED, OUTPUT);
+  pinMode(BED_LED, OUTPUT);
+  pinMode(NIGHT_LED, OUTPUT);
+  pinMode(MOVIE_LED, OUTPUT);
+  pinMode(STATUS_LED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(NIGHT_SWITCH, INPUT_PULLUP);
+
+  digitalWrite(TUBE_LED, LOW);
+  digitalWrite(FAN_LED, LOW);
+  digitalWrite(BED_LED, LOW);
+  digitalWrite(NIGHT_LED, LOW);
+  digitalWrite(MOVIE_LED, LOW);
+  digitalWrite(STATUS_LED, HIGH);
+
+  // --- Initialize Bluetooth Low Energy (BLE) ---
+  BLEDevice::init("CYBERNODE-KRUTHRIM.SIMPLI.CO"); 
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  BLECharacteristic *pCharacteristicTX = pService->createCharacteristic(
+                                        CHARACTERISTIC_UUID_TX,
+                                        BLECharacteristic::PROPERTY_NOTIFY
+                                      );
+  pCharacteristicTX->addDescriptor(new BLE2902());
+
+  BLECharacteristic *pCharacteristicRX = pService->createCharacteristic(
+                                        CHARACTERISTIC_UUID_RX,
+                                        BLECharacteristic::PROPERTY_WRITE
+                                      );
+  pCharacteristicRX->setCallbacks(new MyRxCallbacks());
+
+  pService->start();
+  
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
+  pAdvertising->start();
+  Serial.println("BLE Initialized and Advertising for App...");
+  lastAdvRefreshMillis = millis();
+  lastSecondMillis = millis();
+  lastScrollMillis = millis();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // --- 1. Drift-Free Internal Clock Engine ---
+  if (currentMillis - lastSecondMillis >= 1000) {
+    lastSecondMillis += 1000; 
+    currentSecond++;
+    
+    if (currentSecond >= 60) {
+      currentSecond = 0;
+      currentMinute++;
+      
+      if (currentMinute >= 60) {
+        currentMinute = 0;
+        currentHour24++;
+        
+        if (currentHour24 >= 24) {
+          currentHour24 = 0;
+          alarmFiredToday = false; 
+        }
+      }
+    }
+
+    // --- Daily Alarm Check ---
+    if (alarmEnabled && !alarmFiredToday && currentHour24 == alarmHour24 && currentMinute == alarmMinute && currentSecond == 0) {
+      alarmFiredToday = true;
+      triggerAlarmRoutine();
+    }
+  }
+
+  // --- 2. Airport Board Scrolling Engine (Row 2) ---
+  if (currentMillis - lastScrollMillis >= scrollInterval) {
+    lastScrollMillis = currentMillis;
+    updateDisplay();
+    scrollIndex++;
+  }
+
+  // --- 3. BLE Connection & Advertising Management ---
+  if (doRestartAdvertising) {
+    delay(400); 
+    if (pServer != nullptr) {
+      pServer->startAdvertising(); 
+    } else {
+      BLEDevice::startAdvertising();
+    }
+    Serial.println("BLE Advertising restarted cleanly after disconnect.");
+    doRestartAdvertising = false;
+    lastAdvRefreshMillis = currentMillis; 
+  }
+
+  if (!bleDeviceConnected && (currentMillis - lastAdvRefreshMillis >= advRefreshInterval)) {
+    Serial.println("Not connected. Refreshing advertising state (10s interval)...");
+    if (pServer != nullptr) {
+      pServer->getAdvertising()->stop();
+      delay(100);
+      pServer->startAdvertising();
+    }
+    lastAdvRefreshMillis = currentMillis;
+  }
+
+  runBlindsEngine(currentMillis);
+
+  // Handle incoming command safely in main loop thread context
+  if (bleCommandReceived) {
+    bleCommandReceived = false;
+    Serial.print("Executing App Command: ");
+    Serial.println(pendingBleCommand);
+    cleanBeep();
+    handleCharCommand(pendingBleCommand);
+  }
+
+  // Movie mode handler
+  if (movieModeStep == 1 && movieSubStep == 1) {
+    if (currentMillis - movieTimer >= 3000) { 
+      setBedLamp(true, bedBrightnessLevel); 
+      movieSubStep = 2;
+    }
+  }
+  else if (movieModeStep == 4 && movieSubStep == 1) {
+    if (currentMillis - movieTimer >= 3000) { 
+      desiredBlindStep = 1; 
+      digitalWrite(MOVIE_LED, LOW);
+      setBedLamp(false, 0); 
+      movieModeStep = 0; 
+      movieSubStep = 0;
+      digitalWrite(STATUS_LED, HIGH); 
+    }
+  }
+
+  // Temperature Sensor Loop
+  if (!tempConversionStarted && (currentMillis - previousTempMillis >= tempInterval)) {
+    sensors.requestTemperatures(); 
+    tempRequestTime = currentMillis;
+    tempConversionStarted = true;
+  }
+  
+  if (tempConversionStarted && (currentMillis - tempRequestTime >= 100)) { 
+    currentTemp = sensors.getTempCByIndex(0);
+    if (currentTemp != DEVICE_DISCONNECTED_C) {
+      if (systemActive && !fanManualOverride) {
+        if (currentTemp >= (targetTemp - BUFFER_TEMP)) {
+          digitalWrite(FAN_RELAY, LOW);  
+          digitalWrite(FAN_LED, HIGH);
+        } else {
+          digitalWrite(FAN_RELAY, HIGH); 
+          digitalWrite(FAN_LED, LOW);
+        }
+      }
+    }
+    tempConversionStarted = false;
+    previousTempMillis = currentMillis;
+  }
+
+  // Physical Night Switch
+  int currentPhysicalState = digitalRead(NIGHT_SWITCH);
+  if (currentPhysicalState != lastPhysicalNightState) {
+    delay(20); 
+    currentPhysicalState = digitalRead(NIGHT_SWITCH);
+    if (currentPhysicalState != lastPhysicalNightState) {
+      lastPhysicalNightState = currentPhysicalState;
+      if (currentPhysicalState == LOW) {
+        setNightMode(true);  
+      } else {
+        setNightMode(false); 
+      }
+    }
+  }
+
+  // IR Remote Decoding
+  if (IrReceiver.decode()) {
+    unsigned long rawCode = IrReceiver.decodedIRData.decodedRawData;
+    if (rawCode != 0) {
+      cleanBeep(); 
+      handleRemoteCommand(rawCode);
+    }
+    IrReceiver.resume(); 
+  }
+}
+
+// --- LCD Display & Airport Scrolling Renderer ---
+void updateDisplay() {
+  // Row 1: Temperature and Target Temp (Static)
+  lcd.setCursor(0, 0);
+  char row1Buffer[17];
+  snprintf(row1Buffer, sizeof(row1Buffer), "T:%.1f Set:%.1f  ", currentTemp, targetTemp);
+  lcd.print(row1Buffer);
+
+  // Convert current 24h time to 12h format for display
+  int dispCurrentHour = currentHour24 % 12;
+  if (dispCurrentHour == 0) dispCurrentHour = 12;
+  const char* currentAmPm = (currentHour24 >= 12) ? "PM" : "AM";
+
+  // Format Alarm Display string
+  char alarmStr[12];
+  if (alarmEnabled) {
+    int dispAlarmHour = alarmHour24 % 12;
+    if (dispAlarmHour == 0) dispAlarmHour = 12;
+    const char* alarmAmPm = (alarmHour24 >= 12) ? "PM" : "AM";
+    snprintf(alarmStr, sizeof(alarmStr), "%02d:%02d %s", dispAlarmHour, alarmMinute, alarmAmPm);
+  } else {
+    strcpy(alarmStr, "NOT SET");
+  }
+
+  // Row 2: Airport Board Scrolling Status String (Clean 12hr Format without seconds)
+  char fullStatus[90];
+  snprintf(fullStatus, sizeof(fullStatus), 
+           "   >>> CT:%02d:%02d %s AT:%s B:%d L:%d M:%d N:%d   ", 
+           dispCurrentHour, currentMinute, currentAmPm, alarmStr, 
+           (blindsMoving ? desiredBlindStep : currentBlindStep), 
+           (bedLampState ? bedBrightnessLevel : 0), 
+           movieModeStep, 
+           (nightModeActive ? 1 : 0));
+
+  int stringLen = strlen(fullStatus);
+  if (scrollIndex >= stringLen) {
+    scrollIndex = 0; 
+  }
+
+  char displaySnippet[17];
+  for (int i = 0; i < 16; i++) {
+    int idx = (scrollIndex + i) % stringLen;
+    displaySnippet[i] = fullStatus[idx];
+  }
+  displaySnippet[16] = '\0';
+
+  lcd.setCursor(0, 1);
+  lcd.print(displaySnippet);
+}
+
+// --- Morning Wake-Up Alarm Routine ---
+void triggerAlarmRoutine() {
+  Serial.println("ALARM TRIGGERED: Executing Morning Routine...");
+  multiBeepBuzzer(3); 
+  
+  systemActive = true; 
+  digitalWrite(STATUS_LED, HIGH); 
+  tubeLightState = true;
+  digitalWrite(TUBE_RELAY, LOW); 
+  digitalWrite(TUBE_LED, HIGH);
+  desiredBlindStep = 1; 
+  nightModeActive = false;
+  digitalWrite(NIGHT_LED, LOW);
+}
+
+// --- Audio Feedback ---
+void cleanBeep() {
+  tone(BUZZER_PIN, 1000, 35); 
+  delay(40);
+  noTone(BUZZER_PIN);
+}
+
+void doubleBeepBuzzer() {
+  tone(BUZZER_PIN, 1000, 35);
+  delay(70);
+  tone(BUZZER_PIN, 1000, 35);
+  delay(40);
+  noTone(BUZZER_PIN);
+}
+
+void multiBeepBuzzer(int count) {
+  for (int i = 0; i < count; i++) {
+    tone(BUZZER_PIN, 1000, 35);
+    delay(80);
+    noTone(BUZZER_PIN);
+    if (i < count - 1) delay(60);
+  }
+}
+
+void setBedLamp(bool state, int level) {
+  bedLampState = state;
+  if (state) {
+    bedBrightnessLevel = constrain(level, 1, 5);
+    ledcWrite(BED_PWM_PIN, bedPWMLevels[bedBrightnessLevel]);
+    digitalWrite(BED_LED, HIGH); 
+  } else {
+    ledcWrite(BED_PWM_PIN, 0);
+    digitalWrite(BED_LED, LOW);  
+  }
+}
+
+void runBlindsEngine(unsigned long currentMillis) {
+  if (!blindsMoving) {
+    if (desiredBlindStep != currentBlindStep) {
+      if (desiredBlindStep < 1 || desiredBlindStep > 5) {
+        desiredBlindStep = constrain(desiredBlindStep, 1, 5);
+      }
+      stopBlinds();
+      delay(20);
+
+      movementStartStep = currentBlindStep;
+      int stepsToMove = abs(desiredBlindStep - movementStartStep);
+
+      if (desiredBlindStep > movementStartStep) {
+        digitalWrite(MOTOR_IN1, LOW);
+        digitalWrite(MOTOR_IN2, HIGH);
+        blindsDuration = (unsigned long)(stepsToMove * blindStepTimeDown);
+      } else {
+        digitalWrite(MOTOR_IN1, HIGH);
+        digitalWrite(MOTOR_IN2, LOW);
+        blindsDuration = (unsigned long)(stepsToMove * blindStepTimeUp);
+      }
+
+      ledcWrite(MOTOR_ENA, 200);
+      blindsStartTime = currentMillis;
+      blindsMoving = true;
+    }
+  } 
+  else {
+    if (currentMillis - blindsStartTime >= blindsDuration) {
+      stopBlinds();
+      currentBlindStep = desiredBlindStep; 
+      blindsMoving = false;
+    }
+  }
+}
+
+void stopBlinds() {
+  ledcWrite(MOTOR_ENA, 0); 
+  digitalWrite(MOTOR_IN1, LOW);
+  digitalWrite(MOTOR_IN2, LOW);
+}
+
+void setNightMode(bool enable) {
+  nightModeActive = enable;
+  if (enable) {
+    digitalWrite(NIGHT_LED, HIGH);
+    setBedLamp(true, 3); 
+    digitalWrite(TUBE_RELAY, HIGH); 
+    digitalWrite(TUBE_LED, LOW);
+    tubeLightState = false;
+    desiredBlindStep = 5; 
+  } else {
+    digitalWrite(NIGHT_LED, LOW);
+    setBedLamp(false, 0);
+    digitalWrite(TUBE_RELAY, LOW); 
+    digitalWrite(TUBE_LED, HIGH);
+    tubeLightState = true;
+    desiredBlindStep = 1; 
+  }
+}
+
+void handleCharCommand(char cmd) {
+  switch (cmd) {
+    case '1': handleRemoteCommand(IR_1); break;    
+    case '2': handleRemoteCommand(IR_2); break;    
+    case '3': handleRemoteCommand(IR_3); break;    
+    case '7': handleRemoteCommand(IR_7); break;    
+    case '8': handleRemoteCommand(IR_8); break;    
+    case '9': handleRemoteCommand(IR_9); break;    
+    case '0': handleRemoteCommand(IR_0); break;    
+    case '*': handleRemoteCommand(IR_STAR); break; 
+    case '#': handleRemoteCommand(IR_HASH); break; 
+    case 'U': handleRemoteCommand(IR_UP); break;    
+    case 'D': handleRemoteCommand(IR_DOWN); break;  
+    case 'R': handleRemoteCommand(IR_RIGHT); break; 
+    case 'L': handleRemoteCommand(IR_LEFT); break;  
+    default: 
+      Serial.print("Unknown command character received: ");
+      Serial.println((int)cmd);
+      break;
+  }
+}
+
+void handleRemoteCommand(unsigned long cmd) {
+  if (cmd == IR_1) { 
+    systemActive = true; 
+    digitalWrite(STATUS_LED, HIGH); 
+    tubeLightState = true;
+    digitalWrite(TUBE_RELAY, LOW); 
+    digitalWrite(TUBE_LED, HIGH);
+    desiredBlindStep = 1; 
+  }
+  
+  if (cmd == IR_3) {
+    systemActive = false;
+    nightModeActive = false;
+    movieModeStep = 0;
+    movieSubStep = 0;
+    desiredBlindStep = 5; 
+    digitalWrite(FAN_RELAY, HIGH);
+    digitalWrite(TUBE_RELAY, HIGH);
+    setBedLamp(false, 0); 
+    digitalWrite(TUBE_LED, LOW);
+    digitalWrite(FAN_LED, LOW);
+    digitalWrite(BED_LED, LOW);
+    digitalWrite(NIGHT_LED, LOW);
+    digitalWrite(MOVIE_LED, LOW);
+    digitalWrite(STATUS_LED, LOW); 
+    tubeLightState = false;
+    return;
+  }
+
+  if (!systemActive) return;
+
+  if (cmd == IR_0) {
+    tubeLightState = !tubeLightState;
+    digitalWrite(TUBE_RELAY, tubeLightState ? LOW : HIGH); 
+    digitalWrite(TUBE_LED, tubeLightState ? HIGH : LOW);
+  }
+
+  if (cmd == IR_2) {
+    movieModeStep = (movieModeStep % 4) + 1;
+    multiBeepBuzzer(movieModeStep);
+    
+    if (movieModeStep == 1) {
+      digitalWrite(MOVIE_LED, HIGH);
+      digitalWrite(STATUS_LED, LOW); 
+      digitalWrite(TUBE_RELAY, HIGH); 
+      digitalWrite(TUBE_LED, LOW);
+      tubeLightState = false;
+      desiredBlindStep = 5; 
+      movieTimer = millis();
+      movieSubStep = 1; 
+    } 
+    else if (movieModeStep == 2) {
+      setBedLamp(false, 0);
+    } 
+    else if (movieModeStep == 3) {
+      setBedLamp(true, 3); 
+    } 
+    else if (movieModeStep == 4) {
+      movieTimer = millis();
+      movieSubStep = 1; 
+    }
+  }
+
+  if (cmd == IR_8) {
+    if (bedLampState) {
+      setBedLamp(false, 0);
+    } else {
+      setBedLamp(true, bedBrightnessLevel);
+    }
+  }
+
+  if (cmd == IR_7) {
+    if (bedLampState) {
+      if (bedBrightnessLevel > 1) {
+        bedBrightnessLevel--;
+        ledcWrite(BED_PWM_PIN, bedPWMLevels[bedBrightnessLevel]);
+      } else {
+        doubleBeepBuzzer(); 
+      }
+    }
+  }
+
+  if (cmd == IR_9) {
+    if (bedLampState) {
+      if (bedBrightnessLevel < 5) {
+        bedBrightnessLevel++;
+        ledcWrite(BED_PWM_PIN, bedPWMLevels[bedBrightnessLevel]);
+      } else {
+        doubleBeepBuzzer(); 
+      }
+    }
+  }
+
+  if (cmd == IR_STAR) {
+    fanManualOverride = !fanManualOverride; 
+    if (fanManualOverride) {
+      digitalWrite(FAN_RELAY, HIGH); 
+      digitalWrite(FAN_LED, LOW);
+    }
+  }
+
+  if (cmd == IR_HASH) {
+    setNightMode(!nightModeActive);
+  }
+
+  if (cmd == IR_UP) {
+    if (desiredBlindStep > 1) {
+      desiredBlindStep--;
+    } else {
+      doubleBeepBuzzer(); 
+    }
+  }
+  
+  if (cmd == IR_DOWN) {
+    if (desiredBlindStep < 5) {
+      desiredBlindStep++;
+    } else {
+      doubleBeepBuzzer(); 
+    }
+  }
+
+  if (cmd == IR_RIGHT) { targetTemp += 0.5; }
+  if (cmd == IR_LEFT) { targetTemp -= 0.5; }
+}
